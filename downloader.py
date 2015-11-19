@@ -6,58 +6,81 @@ import sys
 import asyncio
 import urllib.parse
 import time
+import datetime
 
 import aiohttp
 
+class DownloadProxy:
+    def __init__(self):
+        self.queue = []
 
-class Crawler:
-    def __init__(self, rooturl, loop, maxtasks=2):
-        self.rooturl = rooturl
-        self.loop = loop
-        self.done = set()
+    def register(self, url, priority=0):
+        self.queue.append(url)
 
-        self.network_sem = asyncio.Semaphore(maxtasks)
+
+class Downloader:
+
+
+    
+    def __init__(self, download_concurrency=10, domain_download_interval=datetime.timedelta(seconds=2)):
+        self.network_sem = asyncio.Semaphore(download_concurrency)
         self.todo_queue = asyncio.Queue()
+
         self.domain_queues = {}
-
         self.downloaded_html_queue = asyncio.Queue()
+        self.callbacks = []
 
-        # connector stores cookies between requests and uses connection pool
+    def run(self, initial_url):
+        loop = asyncio.get_event_loop()
         self.connector = aiohttp.TCPConnector(share_cookies=True, loop=loop)
-
-    @asyncio.coroutine
-    def run(self):
-        yield from self.todo_queue.put(self.rooturl)
-        task_parser = asyncio.ensure_future(self.parser())  # Set initial work.
-        task = asyncio.ensure_future(self.worker())  # Set initial work.
-        yield from asyncio.sleep(1)
-        while True:
-            yield from asyncio.sleep(1)
-
+        try:
+            print("added handler")
+            loop.add_signal_handler(signal.SIGINT, loop.stop)
+        except RuntimeError:
+            pass
+        done, _ = loop.run_until_complete(asyncio.ensure_future(self._initiate(initial_url)))
         self.connector.close()
-        print("##############################")
-        print("##############################")
-        print("##############################")
-        self.loop.stop()
+
+        for future in done:
+            future.result()
 
     @asyncio.coroutine
-    def parser(self):
+    def _initiate(self, initial_url):
+        try:
+            yield from self.todo_queue.put(initial_url)
+            html_processor = asyncio.ensure_future(self._html_processor())  # Set initial work.
+            task = asyncio.ensure_future(self._worker())  # Set initial work.
+            while True: yield from asyncio.sleep(10)
+        finally:
+            self.connector.close()
+
+    @asyncio.coroutine
+    def register(self, url):
+        yield from self.todo_queue.put(url)
+
+    def subscribe(self, callback):
+        self.callbacks.append(callback)
+
+    @asyncio.coroutine
+    def _html_processor(self):
         while True:
             try:
-                url, html = yield from self.downloaded_html_queue.get()
-                urls = re.findall(r'(?i)href=["\']?([^\s"\'<>]+)', html)
-                for u in urls:
-                    if u not in self.done:
-                        yield from self.todo_queue.put(u)
+                url, html  = yield from self.downloaded_html_queue.get()
+
+                proxy = DownloadProxy()
+                for callback in self.callbacks:
+                    callback(proxy, url, html)
+
+                for next_url in proxy.queue:
+                    yield from self.register(next_url)
+
             finally:
                 self.downloaded_html_queue.task_done()
 
     @asyncio.coroutine
-    def worker(self):
+    def _worker(self):
         while True:
             try:
-                #print(len(self.done), 'completed tasks,', self.todo_queue.qsize(),'in queue.')
-                #yield from asyncio.sleep(2)
                 url = yield from self.todo_queue.get()
                 domain = urllib.parse.urlparse(url).netloc
 
@@ -65,7 +88,7 @@ class Crawler:
                 if domain not in self.domain_queues:
                     first_domain = True
                     self.domain_queues[domain] = asyncio.Queue()
-                    asyncio.ensure_future(self.domain_worker(domain))  # Set initial work.
+                    asyncio.ensure_future(self._domain_worker(domain))  # Set initial work.
 
                 yield from self.domain_queues[domain].put(url)
             finally:
@@ -73,8 +96,7 @@ class Crawler:
 
 
     @asyncio.coroutine
-    def domain_worker(self, domain):
-        import datetime
+    def _domain_worker(self, domain):
         domain_queue = self.domain_queues[domain]
 
         least_interval = datetime.timedelta(seconds=10)
@@ -94,51 +116,21 @@ class Crawler:
 
     @asyncio.coroutine
     def download(self, url):
-        if url not in self.done:
-            yield from self.network_sem.acquire()
-            task = asyncio.ensure_future(self.download_worker(url))
-            task.add_done_callback(lambda t: self.network_sem.release())
+        yield from self.network_sem.acquire()
+        task = asyncio.ensure_future(self.download_worker(url))
+        task.add_done_callback(lambda t: self.network_sem.release())
 
     @asyncio.coroutine
     def download_worker(self, url):
         try:
-            print("downloading",url)
             resp = yield from aiohttp.request('get', url, connector=self.connector)
         except Exception as exc:
             print('...', url, 'has error', repr(str(exc)))
         else:
-            if (resp.status == 200 and
-                    ('text/html' in resp.headers.get('content-type'))):
-                data = (yield from resp.read()).decode('utf-8', 'replace')
-
-                yield from self.downloaded_html_queue.put((url,data))
+            if (resp.status == 200):
+                html = (yield from resp.read()).decode('utf-8', 'replace')
+                yield from self.downloaded_html_queue.put((url, html))
 
             resp.close()
-            self.done.add(url)
 
 
-def main(rooturl):
-    loop = asyncio.get_event_loop()
-
-    c = Crawler(rooturl, loop)
-    asyncio.ensure_future(c.run())
-
-    try:
-        loop.add_signal_handler(signal.SIGINT, loop.stop)
-    except RuntimeError:
-        pass
-    loop.run_forever()
-    print('todo:', c.todo_queue.qsize())
-    print('done:', len(c.done), '; ok:', sum(c.done.values()))
-
-
-if __name__ == '__main__':
-    if '--iocp' in sys.argv:
-        from asyncio import events, windows_events
-        sys.argv.remove('--iocp')
-        logging.info('using iocp')
-        el = windows_events.ProactorEventLoop()
-        events.set_event_loop(el)
-
-    url = "http://news.yahoo.co.jp"
-    main(url)
