@@ -19,7 +19,7 @@ if __name__ == '__main__':
 
     d.subscribe(parser)
 
-    url = "http://news.yahoo.co.jp"
+    url = "http://hamusoku.com/"
     d.run(url)
     print("RUN")
 

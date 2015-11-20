@@ -10,25 +10,23 @@ import datetime
 
 import aiohttp
 
-class DownloadProxy:
-    def __init__(self):
-        self.queue = []
-
-    def register(self, url, priority=0):
-        self.queue.append(url)
-
+__all__=["Downloader"]
 
 class Downloader:
 
+    def __init__(self, download_concurrency=10, domain_download_interval=datetime.timedelta(seconds=10), maxslots=10):
+        self.download_interval = domain_download_interval
 
-    
-    def __init__(self, download_concurrency=10, domain_download_interval=datetime.timedelta(seconds=2)):
         self.network_sem = asyncio.Semaphore(download_concurrency)
         self.todo_queue = asyncio.Queue()
 
-        self.domain_queues = {}
+        self.slot_queues = {}
         self.downloaded_html_queue = asyncio.Queue()
         self.callbacks = []
+
+        self.maxslots = maxslots
+        self.location_to_slotkeys = {}
+        self.slotkey = 0
 
     def run(self, initial_url):
         loop = asyncio.get_event_loop()
@@ -39,6 +37,7 @@ class Downloader:
         except RuntimeError:
             pass
         done, _ = loop.run_until_complete(asyncio.ensure_future(self._initiate(initial_url)))
+
         self.connector.close()
 
         for future in done:
@@ -77,29 +76,37 @@ class Downloader:
             finally:
                 self.downloaded_html_queue.task_done()
 
+    def _get_location(self, url):
+        return urllib.parse.urlparse(url).netloc
+
+    def _get_slot_key(self, url):
+        current_slotkey = self.slotkey
+
+        loc = self._get_location(url)
+        self.location_to_slotkeys[loc] = current_slotkey
+
+        self.slotkey = (self.slotkey + 1)  % self.maxslots
+        return current_slotkey
+
     @asyncio.coroutine
     def _worker(self):
         while True:
             try:
                 url = yield from self.todo_queue.get()
-                domain = urllib.parse.urlparse(url).netloc
+                slot_key = self._get_slot_key(url)
+                if slot_key not in self.slot_queues:
+                    self.slot_queues[slot_key] = asyncio.Queue()
+                    asyncio.ensure_future(self._slot_worker(slot_key))  # Set initial work.
 
-                first_domain = False
-                if domain not in self.domain_queues:
-                    first_domain = True
-                    self.domain_queues[domain] = asyncio.Queue()
-                    asyncio.ensure_future(self._domain_worker(domain))  # Set initial work.
-
-                yield from self.domain_queues[domain].put(url)
+                yield from self.slot_queues[slot_key].put(url)
             finally:
                 self.todo_queue.task_done()
 
 
     @asyncio.coroutine
-    def _domain_worker(self, domain):
-        domain_queue = self.domain_queues[domain]
+    def _slot_worker(self, domain):
+        slot_queue = self.slot_queues[domain]
 
-        least_interval = datetime.timedelta(seconds=10)
         next_downloadable = datetime.datetime.now()
         while True:
             try:
@@ -107,11 +114,11 @@ class Downloader:
                 if now < next_downloadable:
                     wait_second = (next_downloadable-now).total_seconds() 
                     yield from asyncio.sleep(wait_second)
-                url = yield from domain_queue.get()
+                url = yield from slot_queue.get()
                 yield from self.download(url)
-                next_downloadable += least_interval
+                next_downloadable += self.download_interval
             finally:
-                domain_queue.task_done()
+                slot_queue.task_done()
 
 
     @asyncio.coroutine
@@ -133,4 +140,11 @@ class Downloader:
 
             resp.close()
 
+
+class DownloadProxy:
+    def __init__(self):
+        self.queue = []
+
+    def register(self, url, priority=0):
+        self.queue.append(url)
 
